@@ -11,7 +11,6 @@ void bh1750_task(void *pvParameters)
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Falha ao ligar o sensor: %d", ret);
-        return ret;
     }
 
     cmd = BH1750_CONTINUOUS_H_RES_MODE;
@@ -21,7 +20,6 @@ void bh1750_task(void *pvParameters)
     {
         ESP_LOGE(TAG, "Falha ao configurar modo: %d", ret);
     }
-    return ret;
 
     for (;;)
     {
@@ -30,11 +28,12 @@ void bh1750_task(void *pvParameters)
         if (ret != ESP_OK)
         {
             ESP_LOGE(TAG, "Falha na leitura: %d", ret);
-            return -1.0;
         }
 
         // Converte os 2 bytes em um valor de 16 bits
-        uint16_t lux = (data[0] << 8) | data[1];
-        return lux / 2.4; // Fator de conversão para lux
+        uint16_t raw = (data[0] << 8) | data[1];
+        float lux = raw / 2.4;
+        ESP_LOGI(TAG, "Luminosidade: %.2f lux", lux);
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
