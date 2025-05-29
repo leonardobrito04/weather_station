@@ -1,7 +1,6 @@
-#include "sensors.h"
 #include "esp_log.h"
 #include "BH1750.h"
-
+/*
 static const char *TAG = "BH1750";
 
 void bh1750_task(void *pvParameters)
@@ -37,3 +36,4 @@ void bh1750_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
+    */

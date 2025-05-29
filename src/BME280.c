@@ -1,189 +1,106 @@
-#include "BME280.h"
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2c_master.h"
+#include "esp_log.h"
+#include "sdkconfig.h"
+#include "math.h"
+#include "bme280.h"
 
-static const char *TAG = "BME280";
+#define I2C_MASTER_TIMEOUT_MS 1000
 
-void bme280_task(void *pvParameters)
+static void i2c_master_init_bus(i2c_master_bus_handle_t *bus_handle)
 {
-    bme280_t sensor; // Usando a mesma struct do BME280
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = GPIO_NUM_21,
+        .scl_io_num = GPIO_NUM_22,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, bus_handle));
+}
 
-    // Inicializa o sensor
-    if (bme280_init(&sensor, I2C_NUM_0) != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Falha na inicialização do BME280");
-        vTaskDelete(NULL);
-    }
+static void i2c_master_init_handle(i2c_master_bus_handle_t *bus_handle, i2c_master_dev_handle_t *dev_handle, uint8_t address)
+{
+    i2c_device_config_t dev_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = address,
+        .scl_speed_hz = 100000,
+    };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(*bus_handle, &dev_config, dev_handle));
+}
+
+static esp_err_t read_byte_i2c(i2c_master_dev_handle_t dev_handle, uint8_t reg_addr, uint8_t *data, size_t len)
+{
+    return i2c_master_transmit_receive(dev_handle, &reg_addr, 1, data, len, I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
+}
+
+static esp_err_t write_byte_i2c(i2c_master_dev_handle_t dev_handle, uint8_t reg_addr, uint8_t data)
+{
+    uint8_t write_buf[2] = {reg_addr, data};
+    return i2c_master_transmit(dev_handle, write_buf, sizeof(write_buf), I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
+}
+
+void read_bme_280_task(void *arg)
+{
+    i2c_master_bus_handle_t bus_handle;
+    i2c_master_dev_handle_t dev_handle;
+    bme280_calib_data_t calib;
+    i2c_master_init_bus(&bus_handle);
+    i2c_master_init_handle(&bus_handle, &dev_handle, BME280_ADDR);
+
+    uint8_t calib_data[32] = {0};
+
+    read_byte_i2c(dev_handle, BME280_REG_CALIB_START, calib_data, 32);
+
+    calib.dig_T1 = (calib_data[1] << 8) | calib_data[0];
+    calib.dig_T2 = (calib_data[3] << 8) | calib_data[2];
+    calib.dig_T3 = (calib_data[5] << 8) | calib_data[4];
+
+    calib.dig_P1 = (calib_data[7] << 8) | calib_data[6];
+    calib.dig_P2 = (calib_data[9] << 8) | calib_data[8];
+    calib.dig_P3 = (calib_data[11] << 8) | calib_data[10];
+    calib.dig_P4 = (calib_data[13] << 8) | calib_data[12];
+    calib.dig_P5 = (calib_data[15] << 8) | calib_data[14];
+    calib.dig_P6 = (calib_data[17] << 8) | calib_data[16];
+    calib.dig_P7 = (calib_data[19] << 8) | calib_data[18];
+    calib.dig_P8 = (calib_data[21] << 8) | calib_data[20];
+    calib.dig_P9 = (calib_data[23] << 8) | calib_data[22];
+
+    calib.dig_H1 = calib_data[25];
+    calib.dig_H2 = (calib_data[27] << 8) | calib_data[26];
+    calib.dig_H3 = calib_data[27];
+    calib.dig_H4 = ((calib_data[29] << 4) | (calib_data[30] & 0x0F));
+    calib.dig_H5 = ((calib_data[31] << 4) | (calib_data[30] >> 4));
+    calib.dig_H6 = calib_data[32];
 
     for (;;)
     {
-        // Lê os dados do sensor
-        if (bme280_read_data(&sensor) == ESP_OK)
-        {
-            ESP_LOGI(TAG, "Temperatura: %.2f °C, Pressão: %.2f hPa, Umidade: %.2f",
-                     sensor.temperature, sensor.pressure, sensor.humidity);
-        }
+        write_byte_i2c(dev_handle, BME280_REG_CTRL_MEAS, 0x25);
+        write_byte_i2c(dev_handle, BME280_REG_CTRL_HUM, 0x01);
 
-        // Intervalo de leitura (2 segundos)
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        uint8_t temp_data[3], press_data[3], humidity_data[2];
+
+        read_byte_i2c(dev_handle, BME280_REG_TEMP_MSB, temp_data, 3);
+        read_byte_i2c(dev_handle, BME280_REG_PRESS_MSB, press_data, 3);
+        read_byte_i2c(dev_handle, BME280_REG_HUM_MSB, humidity_data, 2);
+
+        int32_t adc_T = (temp_data[0] << 12) | (temp_data[1] << 4) | (temp_data[2] >> 4);
+        int32_t compensated_temp = compensate_temperature(adc_T, &calib);
+        float temperature = compensated_temp / 100.0f;
+
+        int32_t adc_P = (press_data[0] << 12) | (press_data[1] << 4) | (press_data[2] >> 4);
+        int32_t compensated_pressure = compensate_pressure(adc_P, &calib);
+        float pressure = compensated_pressure / 25600.0f;
+
+        uint16_t adc_H = (humidity_data[0] << 8) | humidity_data[1];
+        int32_t compensated_humidity = compensate_humidity(adc_H, &calib);
+        float humidity = compensated_humidity / 1024.0f;
+
+        ESP_LOGI("BME280", "Temperatura: %.2f °C, Pressao: %.2f hPa, Umidade: %.2f %%", temperature, pressure, humidity);
+
+        vTaskDelay(2000 / portTICK_PERIOD_MS); 
     }
-}
-
-// Função auxiliar para leitura de registros
-static esp_err_t bme280_read_register(bme280_t *dev, uint8_t reg, uint8_t *data, uint8_t len)
-{
-    return i2c_master_write_read_device(dev->i2c_port, BME280_ADDR, &reg, 1, data, len, pdMS_TO_TICKS(1000));
-}
-
-// Função auxiliar para escrita de registros
-static esp_err_t bme280_write_register(bme280_t *dev, uint8_t reg, uint8_t value)
-{
-    uint8_t buf[2] = {reg, value};
-    return i2c_master_write_to_device(dev->i2c_port, BME280_ADDR, buf, sizeof(buf), pdMS_TO_TICKS(1000));
-}
-
-// Inicialização do sensor
-esp_err_t bme280_init(bme280_t *dev, i2c_port_t port)
-{
-    dev->i2c_port = port;
-
-    // Verifica ID do chip
-    uint8_t chip_id;
-    ESP_ERROR_CHECK(bme280_read_register(dev, BME280_REG_ID, &chip_id, 1));
-
-    /*if (chip_id != 0x58) {
-        ESP_LOGE(TAG, "Chip ID inválido: 0x%02X", chip_id);
-        return ESP_ERR_NOT_FOUND;
-    }*/
-
-    // Reseta o sensor
-    bme280_reset(dev);
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    // Carrega parâmetros de calibração
-    uint8_t calib_data[24];
-    ESP_ERROR_CHECK(bme280_read_register(dev, 0x88, calib_data, 24));
-
-    // Converte dados de calibração
-    dev->calib.dig_T1 = (calib_data[1] << 8) | calib_data[0];
-    dev->calib.dig_T2 = (calib_data[3] << 8) | calib_data[2];
-    dev->calib.dig_T3 = (calib_data[5] << 8) | calib_data[4];
-
-    dev->calib.dig_P1 = (calib_data[7] << 8) | calib_data[6];
-    dev->calib.dig_P2 = (calib_data[9] << 8) | calib_data[8];
-    dev->calib.dig_P3 = (calib_data[11] << 8) | calib_data[10];
-    dev->calib.dig_P4 = (calib_data[13] << 8) | calib_data[12];
-    dev->calib.dig_P5 = (calib_data[15] << 8) | calib_data[14];
-    dev->calib.dig_P6 = (calib_data[17] << 8) | calib_data[16];
-    dev->calib.dig_P7 = (calib_data[19] << 8) | calib_data[18];
-    dev->calib.dig_P8 = (calib_data[21] << 8) | calib_data[20];
-    dev->calib.dig_P9 = (calib_data[23] << 8) | calib_data[22];
-
-    // Configura o sensor
-    ESP_ERROR_CHECK(bme280_write_register(dev, BME280_REG_CONFIG, 0x00));    // Filtro desligado
-    ESP_ERROR_CHECK(bme280_write_register(dev, BME280_REG_CTRL_MEAS, 0x3F)); // Oversampling máximo, modo normal
-
-    return ESP_OK;
-}
-
-esp_err_t bme280_read_raw_data(bme280_t *dev, int32_t *adc_t, int32_t *adc_p)
-{
-    uint8_t data[6];
-    ESP_ERROR_CHECK(bme280_read_register(dev, BME280_REG_PRESS_MSB, data, 6));
-
-    *adc_p = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4);
-    *adc_t = (data[3] << 12) | (data[4] << 4) | (data[5] >> 4);
-
-    return ESP_OK;
-}
-
-esp_err_t bme280_read_raw_humidity(bme280_t *dev, int32_t *adc_h)
-{
-    uint8_t data[2];
-    esp_err_t ret = bme280_read_register(dev, BME280_REG_HUM_MSB, data, 2);
-    if (ret != ESP_OK)
-        return ret;
-
-    *adc_h = (data[0] << 8) | data[1];
-    return ESP_OK;
-}
-
-int32_t bme280_compensate_temperature(bme280_t *dev, int32_t adc_t)
-{
-    int32_t var1 = ((((adc_t >> 3) - ((int32_t)dev->calib.dig_T1 << 1))) * ((int32_t)dev->calib.dig_T2)) >> 11;
-    int32_t var2 = (((((adc_t >> 4) - ((int32_t)dev->calib.dig_T1)) * ((adc_t >> 4) - ((int32_t)dev->calib.dig_T1))) >> 12) * ((int32_t)dev->calib.dig_T3)) >> 14;
-    int32_t t_fine = var1 + var2;
-
-    dev->temperature = (t_fine * 5 + 128) >> 8;
-    dev->temperature /= 100.0f;
-
-    return t_fine;
-}
-
-esp_err_t bme280_compensate_pressure(bme280_t *dev, int32_t adc_p, int32_t t_fine)
-{
-    int64_t var1 = ((int64_t)t_fine) - 128000;
-    int64_t var2 = var1 * var1 * (int64_t)dev->calib.dig_P6;
-    var2 += ((var1 * (int64_t)dev->calib.dig_P5) << 17);
-    var2 += (((int64_t)dev->calib.dig_P4) << 35);
-    int64_t var3 = ((var1 * var1 * (int64_t)dev->calib.dig_P3) >> 8) + ((var1 * (int64_t)dev->calib.dig_P2) << 12);
-    var3 = (((((int64_t)1) << 47) + var3)) * ((int64_t)dev->calib.dig_P1) >> 33;
-
-    if (var3 == 0)
-    {
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-
-    int64_t p = 1048576 - adc_p;
-    p = (((p << 31) - var2) * 3125) / var3;
-    var2 = (((int64_t)dev->calib.dig_P9) * (p >> 13) * (p >> 13)) >> 25;
-    var3 = (((int64_t)dev->calib.dig_P8) * p) >> 19;
-    p = ((p + var2 + var3) >> 8) + (((int64_t)dev->calib.dig_P7) << 4);
-
-    dev->pressure = (float)p / 25600.0f;
-    return ESP_OK;
-}
-
-void bme280_compensate_humidity(bme280_t *dev, int32_t adc_h, int32_t t_fine)
-{
-    int32_t v_x1_u32r;
-
-    v_x1_u32r = (t_fine - ((int32_t)76800));
-    v_x1_u32r = (((((adc_h << 14) - (((int32_t)dev->calib.dig_H4) << 20) - (((int32_t)dev->calib.dig_H5) * v_x1_u32r)) + ((int32_t)16384)) >> 15) *
-                 (((((((v_x1_u32r * ((int32_t)dev->calib.dig_H6)) >> 10) * (((v_x1_u32r * ((int32_t)dev->calib.dig_H3)) >> 11) + ((int32_t)32768))) >> 10) +
-                    ((int32_t)2097152)) *
-                       ((int32_t)dev->calib.dig_H2) +
-                   8192) >>
-                  14));
-
-    v_x1_u32r = v_x1_u32r - (((((v_x1_u32r >> 15) * (v_x1_u32r >> 15)) >> 7) * ((int32_t)dev->calib.dig_H1)) >> 4);
-    v_x1_u32r = (v_x1_u32r < 0 ? 0 : v_x1_u32r);
-    v_x1_u32r = (v_x1_u32r > 419430400 ? 419430400 : v_x1_u32r);
-    dev->humidity = ((float)(v_x1_u32r >> 12)) / 1024.0f;
-}
-
-esp_err_t bme280_read_data(bme280_t *dev)
-{
-    int32_t adc_t, adc_p, adc_h;
-    esp_err_t ret = bme280_read_raw_data(dev, &adc_t, &adc_p);
-    if (ret != ESP_OK)
-        return ret;
-
-    ret = bme280_read_raw_humidity(dev, &adc_h);
-    if (ret != ESP_OK)
-        return ret;
-
-    int32_t t_fine = bme280_compensate_temperature(dev, adc_t);
-
-    ret = bme280_compensate_pressure(dev, adc_p, t_fine);
-    if (ret != ESP_OK)
-        return ret;
-
-    bme280_compensate_humidity(dev, adc_h, t_fine);
-
-    return ESP_OK;
-}
-
-// Reset do sensor
-void bme280_reset(bme280_t *dev)
-{
-    bme280_write_register(dev, BME280_REG_RESET, 0xB6);
 }

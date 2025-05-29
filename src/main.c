@@ -1,42 +1,28 @@
-#include "sensors.h"
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2c_master.h"
+#include "sdkconfig.h"
+#include "bme280.h"
+#include "esp_log.h"
+#include "driver/gpio.h"
 
-void i2c_master_init(void) {
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = 21,
-        .scl_io_num = 22,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 100000,
-    };
-    i2c_param_config(I2C_MASTER_NUM, &conf);
-    i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
-}
+#define TAG "BME280_MAIN"
 
-void app_main() {
-    // Inicializa I2C
-    i2c_master_init();
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Sistema inicializado");
+    ESP_LOGI(TAG, "Criando tarefa para leitura do BME280");
 
-    // Cria tasks
-    /*xTaskCreate(
-        bh1750_task,    
-        "BH1750_Task",  
-        2048,           
-        NULL,           
-        5,              
-        NULL           
-    );*/
-
+    // Cria a tarefa para leitura do sensor
     xTaskCreate(
-        bme280_task,        // Função da task
-        "bme280_task",      // Nome da task
-        4096,               // Tamanho da stack (aumente se necessário)
-        NULL,               // Parâmetros
-        5,                  // Prioridade (0-25)
-        NULL                // Handle da task
+        read_bme_280_task,    // Função da tarefa
+        "bme280_task",        // Nome da tarefa
+        4096,                 // Tamanho da stack (pode ajustar conforme necessidade)
+        NULL,                 // Parâmetros para a tarefa
+        5,                    // Prioridade (0-24, sendo 24 a mais alta)
+        NULL                  // Handle para referência à tarefa
     );
 
-    for(;;) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
-    }
+    ESP_LOGI(TAG, "Tarefa criada com sucesso");
 }
